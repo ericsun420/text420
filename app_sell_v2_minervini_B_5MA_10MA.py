@@ -32,6 +32,7 @@ APP_TITLE = "OMEGA 趨勢起漲戰情室"
 APP_SUBTITLE = "v13.4 Stage 2 趨勢模板｜起漲雷達｜族群共振｜風控交易"
 FUGLE_API_KEY = "ZWJjZDhjZWYtMjhhMi00YWI2LTliNWQtMmViYzVhMmIzODdjIGY1N2Y0MGZmLWQ1MjgtNDk1OC1iZTljLWMxOWUwODQ4Y2U2Zg=="
 API_TIMEOUT = (3.0, 10.0)
+FINMIND_USER_INFO_URL = "https://api.web.finmindtrade.com/v2/user_info"
 PUBLIC_TIMEOUT = (3.0, 12.0)
 RAW_HISTORY_DAYS = 420
 DEFAULT_COOLDOWN_SECONDS = 45
@@ -416,6 +417,52 @@ def get_api_key():
     if not key:
         key = FUGLE_API_KEY
     return str(key).strip()
+
+
+def get_finmind_token():
+    token = ""
+    for secret_key in ("FINMIND_API_TOKEN", "FINMIND_TOKEN"):
+        if token:
+            break
+        try:
+            token = st.secrets.get(secret_key, "")
+        except Exception:
+            token = token or ""
+    if not token:
+        token = os.getenv("FINMIND_API_TOKEN", "") or os.getenv("FINMIND_TOKEN", "")
+    return str(token).strip()
+
+
+def finmind_get_user_info(session, token: str):
+    token = str(token or "").strip()
+    if not token:
+        return False, {"message": "missing token"}
+
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        resp = session.get(FINMIND_USER_INFO_URL, headers=headers, timeout=API_TIMEOUT)
+        try:
+            payload = resp.json()
+        except Exception:
+            payload = {"raw": resp.text[:300]}
+        if resp.status_code == 200 and isinstance(payload, dict):
+            if ("user_count" in payload) or ("api_request_limit" in payload):
+                return True, payload
+        # fallback: some environments/docs examples also mention token param
+        resp2 = session.get(FINMIND_USER_INFO_URL, headers=headers, params={"token": token}, timeout=API_TIMEOUT)
+        try:
+            payload2 = resp2.json()
+        except Exception:
+            payload2 = {"raw": resp2.text[:300]}
+        if resp2.status_code == 200 and isinstance(payload2, dict) and (("user_count" in payload2) or ("api_request_limit" in payload2)):
+            return True, payload2
+        return False, {
+            "status_code": getattr(resp2, "status_code", getattr(resp, "status_code", None)),
+            "message": payload2.get("msg") if isinstance(payload2, dict) else payload.get("msg", "request failed"),
+            "payload": payload2 if isinstance(payload2, dict) else payload,
+        }
+    except Exception as e:
+        return False, {"message": str(e)}
 
 
 def fugle_get_json(session, path, api_key, params=None):
@@ -3253,10 +3300,33 @@ with launch_col:
     launch = st.button("🚀 取得最新市場資料 / 建立快速資料庫")
 with api_col:
     api_key = get_api_key()
+    finmind_token = get_finmind_token()
     if api_key:
         st.success("✅ 已偵測到 Fugle API Key")
     else:
         st.warning("⚠️ 尚未偵測到 Fugle API Key，將無法抓取最新官方資料。")
+
+    manual_finmind_token = st.text_input(
+        "FinMind Token（可直接貼上測試）",
+        value="",
+        type="password",
+        help="若未放在 Streamlit secrets / 環境變數，可直接貼在這裡測試 user_info。",
+    )
+    effective_finmind_token = str(manual_finmind_token or finmind_token or "").strip()
+
+    run_finmind_test = bool(effective_finmind_token) and (bool(finmind_token) or st.button("測試 FinMind user_info", use_container_width=True))
+    if run_finmind_test:
+        with requests.Session() as _fm_session:
+            fm_ok, fm_info = finmind_get_user_info(_fm_session, effective_finmind_token)
+        if fm_ok:
+            used = safe_int(fm_info.get("user_count"), 0)
+            limit = safe_int(fm_info.get("api_request_limit"), 0)
+            st.success(f"✅ FinMind user_info 測試成功｜已用量 {used} / {limit}")
+        else:
+            st.warning(f"⚠️ FinMind user_info 測試失敗：{fm_info.get('message', 'unknown error')}")
+    else:
+        st.info("ℹ️ 可把 FinMind token 放進 secrets / 環境變數，或直接貼上後按按鈕測試。")
+
     if not HAS_YF:
         st.info("ℹ️ 目前環境沒有 yfinance，App 仍可開啟，但歷史資料、Stage2細節、續漲預測與回測會降級。")
 st.markdown('</div>', unsafe_allow_html=True)
