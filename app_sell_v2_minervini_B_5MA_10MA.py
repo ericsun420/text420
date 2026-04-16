@@ -87,7 +87,18 @@ def diag_init():
 
 
 def diag_err(diag, e, tag="ERR"):
-    return
+    try:
+        if diag is None:
+            return
+        if not isinstance(diag.get("last_errors"), deque):
+            diag["last_errors"] = deque(diag.get("last_errors", []), maxlen=12)
+        diag["other_err"] = safe_int(diag.get("other_err", 0), 0) + 1
+        err_type = type(e).__name__ if e is not None else "Exception"
+        err_msg = str(e).strip() if e is not None else ""
+        msg = f"[{tag}] {err_type}: {err_msg}" if err_msg else f"[{tag}] {err_type}"
+        diag["last_errors"].appendleft(msg[:240])
+    except Exception:
+        return
 
 
 # ============================================================
@@ -778,6 +789,25 @@ def _build_trend_template_features(past_df):
     first_reclaim_5ma = close_above_5 and prev_close <= prev_ma5 and day_close_pos >= 0.55
     near_10ma = ma10 > 0 and abs(last_close - ma10) / max(ma10, 1e-9) <= 0.03
 
+    vol_ma5 = safe_float(vol.rolling(5).mean().iloc[-1], 0.0)
+    vol_ratio5 = (safe_float(vol.iloc[-1], 0.0) / max(vol_ma5, 1e-9)) if vol_ma5 > 0 else 0.0
+    ma5_slope = ((ma5 - prev_ma5) / max(prev_ma5, 1e-9)) if prev_ma5 > 0 else 0.0
+    dist_ma5_pct = ((last_close - ma5) / max(ma5, 1e-9) * 100.0) if ma5 > 0 else 0.0
+    dist_ma10_pct = ((last_close - ma10) / max(ma10, 1e-9) * 100.0) if ma10 > 0 else 0.0
+    resistance_room_pct = ((high_52w - last_close) / max(last_close, 1e-9) * 100.0) if high_52w > 0 and last_close > 0 else 0.0
+    near_breakout = high_52w > 0 and resistance_room_pct <= 3.5
+
+    ma10_series = close.rolling(10).mean()
+    below10_streak = 0
+    lookback_n = min(len(close), 10)
+    for i in range(1, lookback_n + 1):
+        c = safe_float(close.iloc[-i], 0.0)
+        m10 = safe_float(ma10_series.iloc[-i], 0.0)
+        if m10 > 0 and c < m10:
+            below10_streak += 1
+        else:
+            break
+
     stage_checks = {
         "price_above_ma150_200": last_close > ma150 > 0 and last_close > ma200 > 0,
         "ma_alignment": ma50 > ma150 > ma200 > 0,
@@ -945,12 +975,14 @@ def compute_feature_cache(candidate_df, meta_dict, diag, status_placeholder, per
             df = _extract_symbol_frame(raw_daily, sym)
             if df.empty or not {"Close", "Volume", "High", "Low", "Open"}.issubset(set(df.columns)):
                 diag["feature_fail"] += 1
+                diag_err(diag, RuntimeError(f"{code}: 缺少 OHLCV 或資料為空"), "FEATURE_SKIP")
                 continue
             df = df[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
             dates_tw = pd.Index([idx_date_taipei(x) for x in df.index])
             past_df = df[dates_tw < today_date].copy()
             if len(past_df) < 35:
                 diag["feature_fail"] += 1
+                diag_err(diag, RuntimeError(f"{code}: 歷史資料不足({len(past_df)})"), "FEATURE_SKIP")
                 continue
 
             close = past_df["Close"].astype(float)
