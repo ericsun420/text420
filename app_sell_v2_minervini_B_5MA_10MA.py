@@ -749,21 +749,34 @@ def _build_trend_template_features(past_df):
     high = past_df["High"].astype(float)
     low = past_df["Low"].astype(float)
 
+    ma5_series = close.rolling(5).mean()
+    ma10_series = close.rolling(10).mean()
     ma50_series = close.rolling(50).mean()
     ma150_series = close.rolling(150).mean()
     ma200_series = close.rolling(200).mean()
+    ma5 = safe_float(ma5_series.iloc[-1], 0.0)
+    ma10 = safe_float(ma10_series.iloc[-1], 0.0)
     ma50 = safe_float(ma50_series.iloc[-1], 0.0)
     ma150 = safe_float(ma150_series.iloc[-1], 0.0)
     ma200 = safe_float(ma200_series.iloc[-1], 0.0)
+    prev_ma5 = safe_float(ma5_series.iloc[-2], ma5) if len(ma5_series) >= 2 else ma5
+    prev_ma10 = safe_float(ma10_series.iloc[-2], ma10) if len(ma10_series) >= 2 else ma10
     ma50_prev20 = safe_float(ma50_series.iloc[-21], ma50) if len(ma50_series) >= 21 else ma50
     ma200_prev20 = safe_float(ma200_series.iloc[-21], ma200) if len(ma200_series) >= 21 else ma200
 
     high_52w = safe_float(high.tail(252).max(), 0.0)
     low_52w = safe_float(low.tail(252).min(), 0.0)
     last_close = safe_float(close.iloc[-1], 0.0)
+    prev_close = safe_float(close.iloc[-2], last_close) if len(close) >= 2 else last_close
     pivot_low_10 = safe_float(low.tail(10).min(), 0.0)
     pivot_low_20 = safe_float(low.tail(20).min(), 0.0)
     atr14 = safe_float((high - low).rolling(14).mean().iloc[-1], 0.0)
+    day_rng = max(safe_float(high.iloc[-1], last_close) - safe_float(low.iloc[-1], last_close), 1e-9)
+    day_close_pos = ((last_close - safe_float(low.iloc[-1], last_close)) / day_rng) if len(low) else 0.5
+    close_above_5 = last_close > ma5 > 0
+    close_above_10 = last_close > ma10 > 0
+    first_reclaim_5ma = close_above_5 and prev_close <= prev_ma5 and day_close_pos >= 0.55
+    near_10ma = ma10 > 0 and abs(last_close - ma10) / max(ma10, 1e-9) <= 0.03
 
     stage_checks = {
         "price_above_ma150_200": last_close > ma150 > 0 and last_close > ma200 > 0,
@@ -797,9 +810,18 @@ def _build_trend_template_features(past_df):
     stage_score = sum(1 for ok in stage_checks.values() if ok)
 
     return {
+        "ma5": ma5,
+        "ma10": ma10,
         "ma50": ma50,
         "ma150": ma150,
         "ma200": ma200,
+        "prev_ma5": prev_ma5,
+        "prev_ma10": prev_ma10,
+        "close_above_5": close_above_5,
+        "close_above_10": close_above_10,
+        "first_reclaim_5ma": first_reclaim_5ma,
+        "near_10ma": near_10ma,
+        "day_close_pos": day_close_pos,
         "ma50_prev20": ma50_prev20,
         "ma200_prev20": ma200_prev20,
         "ma50_slope_pct": ((ma50 / ma50_prev20 - 1.0) * 100.0) if ma50 > 0 and ma50_prev20 > 0 else 0.0,
@@ -1182,9 +1204,15 @@ def evaluate_candidate_record(r, feat, now_ts, is_test, use_bloodline, only_tse,
     ret20 = safe_float(feat.get("ret20"), 0.0)
     range20_pct = safe_float(feat.get("range20_pct"), 0.0)
     vol_ma5 = safe_float(feat.get("vol_ma5"), 0.0)
+    ma5 = safe_float(feat.get("ma5"), 0.0)
+    ma10 = safe_float(feat.get("ma10"), 0.0)
     ma50 = safe_float(feat.get("ma50"), 0.0)
     ma150 = safe_float(feat.get("ma150"), 0.0)
     ma200 = safe_float(feat.get("ma200"), 0.0)
+    close_above_5 = bool(feat.get("close_above_5", False))
+    close_above_10 = bool(feat.get("close_above_10", False))
+    first_reclaim_5ma = bool(feat.get("first_reclaim_5ma", False))
+    near_10ma = bool(feat.get("near_10ma", False))
     stage2_pass = bool(feat.get("trend_template_pass", False))
     stage2_score = safe_int(feat.get("trend_template_score", 0), 0)
     stage2_note = str(feat.get("trend_template_note", "資料不足"))
@@ -1218,6 +1246,16 @@ def evaluate_candidate_record(r, feat, now_ts, is_test, use_bloodline, only_tse,
     score += 0.9 if proximity_52w >= 95 else 0.5 if proximity_52w >= 88 else 0.0
     score += 0.35 if ret5 > 0 else 0.0
     score += 0.35 if ret20 > 0 else 0.0
+    if first_reclaim_5ma:
+        score += 1.15
+    elif close_above_5:
+        score += 0.40
+    else:
+        score -= 0.55
+    if close_above_10:
+        score += 0.35
+    else:
+        score -= 0.75
     if stage2_pass:
         score += 1.0
     elif not hist_missing:
@@ -1260,6 +1298,17 @@ def evaluate_candidate_record(r, feat, now_ts, is_test, use_bloodline, only_tse,
         risk_count += 1
         risk_flags.append("收在偏低")
 
+    if not close_above_5:
+        risk_count += 1
+        risk_flags.append("未站穩 5MA")
+
+    if not close_above_10:
+        score -= 0.25
+        risk_count += 1
+        risk_flags.append("跌破 10MA 防守")
+    elif near_10ma:
+        score += 0.10
+
     if ma50 > 0 and r["last"] < ma50:
         score -= 0.9
         risk_count += 1
@@ -1268,14 +1317,14 @@ def evaluate_candidate_record(r, feat, now_ts, is_test, use_bloodline, only_tse,
     bloodline_note = ""
     if use_bloodline:
         if board_streak >= max(2, min_board + 1):
-            score += 1.35
+            score += 0.85
             bloodline_note = "｜血統強"
             risk_count = max(0, risk_count - 1)
         elif board_streak >= min_board:
-            score += 0.70
+            score += 0.40
             bloodline_note = "｜血統穩"
         else:
-            score -= 0.80 if not is_test else 0.35
+            score -= 0.35 if not is_test else 0.12
             risk_flags.append("血統偏弱")
             risk_count += 1
             bloodline_note = "｜新起漲"
@@ -1337,13 +1386,25 @@ def evaluate_candidate_record(r, feat, now_ts, is_test, use_bloodline, only_tse,
     elif not hist_missing:
         breakout_score -= 0.35
 
+    if first_reclaim_5ma:
+        breakout_score += 0.85
+    elif close_above_5:
+        breakout_score += 0.20
+    else:
+        breakout_score -= 0.30
+
+    if close_above_10:
+        breakout_score += 0.20
+    else:
+        breakout_score -= 0.45
+
     if use_bloodline:
         if board_streak >= max(2, min_board + 1):
-            breakout_score += 0.55
-        elif board_streak >= min_board:
             breakout_score += 0.25
+        elif board_streak >= min_board:
+            breakout_score += 0.12
         else:
-            breakout_score -= 0.30 if not is_test else 0.12
+            breakout_score -= 0.12 if not is_test else 0.05
     else:
         if board_streak == 0:
             breakout_score += 0.45
@@ -1410,6 +1471,11 @@ def evaluate_candidate_record(r, feat, now_ts, is_test, use_bloodline, only_tse,
         "Stage2模板": "通過" if stage2_pass else "未通過",
         "Stage2分數": f"{stage2_score}/7",
         "Stage2說明": stage2_note,
+        "第一天站穩5MA": 1 if first_reclaim_5ma else 0,
+        "站上5MA": 1 if close_above_5 else 0,
+        "站上10MA": 1 if close_above_10 else 0,
+        "5MA": round(ma5, 2) if ma5 > 0 else 0.0,
+        "10MA": round(ma10, 2) if ma10 > 0 else 0.0,
         "50MA": round(ma50, 2) if ma50 > 0 else 0.0,
         "150MA": round(ma150, 2) if ma150 > 0 else 0.0,
         "200MA": round(ma200, 2) if ma200 > 0 else 0.0,
@@ -1855,6 +1921,14 @@ def apply_dynamic_filters(raw_df, feature_cache, now_ts, is_test, use_bloodline,
             res["族群共振分數"] = 0.0
         if "同族群跟漲數" not in res.columns:
             res["同族群跟漲數"] = 0
+        if "第一天站穩5MA" not in res.columns:
+            res["第一天站穩5MA"] = 0
+        if "站上5MA" not in res.columns:
+            res["站上5MA"] = 0
+        if "站上10MA" not in res.columns:
+            res["站上10MA"] = 0
+        if "board_val" not in res.columns:
+            res["board_val"] = 0
         res["模式排序分"] = (
             res["今日表現分數"].astype(float)
             + res["起漲雷達分數"].astype(float) * 0.72
