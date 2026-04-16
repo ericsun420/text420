@@ -30,7 +30,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ============================================================
 APP_TITLE = "OMEGA 趨勢起漲戰情室"
 APP_SUBTITLE = "v13.4 Stage 2 趨勢模板｜起漲雷達｜族群共振｜風控交易"
-FUGLE_API_KEY = "ZWJjZDhjZWYtMjhhMi00YWI2LTliNWQtMmViYzVhMmIzODdjIGY1N2Y0MGZmLWQ1MjgtNDk1OC1iZTljLWMxOWUwODQ4Y2U2Zg=="
+FINMIND_API_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoicWppMzk0MjgiLCJlbWFpbCI6InFqaTM5NDI4QGdtYWlsLmNvbSJ9.UE6kvHEmaXYew1pwkHQGYtTcaqvEymitzTtIfio-6P0"
 API_TIMEOUT = (3.0, 10.0)
 FINMIND_USER_INFO_URL = "https://api.web.finmindtrade.com/v2/user_info"
 PUBLIC_TIMEOUT = (3.0, 12.0)
@@ -407,30 +407,11 @@ def refine_industry(code: str, name: str, industry: str) -> str:
 
     return industry
 def get_api_key():
-    key = ""
-    try:
-        key = st.secrets.get("FUGLE_API_KEY", "")
-    except Exception:
-        key = ""
-    if not key:
-        key = os.getenv("FUGLE_API_KEY", "")
-    if not key:
-        key = FUGLE_API_KEY
-    return str(key).strip()
+    return str(FINMIND_API_TOKEN).strip()
 
 
 def get_finmind_token():
-    token = ""
-    for secret_key in ("FINMIND_API_TOKEN", "FINMIND_TOKEN"):
-        if token:
-            break
-        try:
-            token = st.secrets.get(secret_key, "")
-        except Exception:
-            token = token or ""
-    if not token:
-        token = os.getenv("FINMIND_API_TOKEN", "") or os.getenv("FINMIND_TOKEN", "")
-    return str(token).strip()
+    return str(FINMIND_API_TOKEN).strip()
 
 
 def finmind_get_user_info(session, token: str):
@@ -465,11 +446,82 @@ def finmind_get_user_info(session, token: str):
         return False, {"message": str(e)}
 
 
+def finmind_get_data(session, token, dataset, data_id=None, start_date=None, end_date=None):
+    url = "https://api.finmindtrade.com/api/v4/data"
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {"dataset": dataset}
+    if data_id:
+        params["data_id"] = str(data_id)
+    if start_date:
+        params["start_date"] = str(start_date)
+    if end_date:
+        params["end_date"] = str(end_date)
+    return session.get(url, headers=headers, params=params, timeout=API_TIMEOUT)
+
+
+def finmind_latest_price_row(session, token, code, lookback_days=20):
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=max(lookback_days, 10))
+    r = finmind_get_data(
+        session,
+        token,
+        dataset="TaiwanStockPrice",
+        data_id=code,
+        start_date=start_date.isoformat(),
+        end_date=end_date.isoformat(),
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"FINMIND_PRICE_{code}_{r.status_code}")
+    payload = r.json()
+    data = payload.get("data", []) if isinstance(payload, dict) else []
+    if not data:
+        raise RuntimeError(f"FINMIND_PRICE_{code}_EMPTY")
+    data = sorted(data, key=lambda x: str(x.get("date", "")))
+    row = data[-1]
+    return row
+
+
+def price_row_to_quote(code, meta_dict, row, rank_order=0):
+    ref = safe_float(row.get("close"), 0.0) - safe_float(row.get("spread"), 0.0)
+    last = safe_float(row.get("close"), 0.0)
+    high = safe_float(row.get("max"), last)
+    low = safe_float(row.get("min"), last)
+    open_ = safe_float(row.get("open"), last)
+    vol = safe_int(row.get("Trading_Volume"), 0)
+    val = safe_float(row.get("Trading_money"), 0.0)
+    change = safe_float(row.get("spread"), last - ref)
+    if ref <= 0 and last > 0:
+        ref = max(last - change, 0.0)
+    if ref <= 0 or last <= 0:
+        raise RuntimeError(f"QUOTE_{code}_EMPTY")
+    upper = calc_limit_up(ref)
+    return {
+        "code": code,
+        "name": meta_dict[code]["name"],
+        "market": market_of(code, meta_dict),
+        "industry": meta_dict[code].get("industry", "其他"),
+        "open": open_,
+        "high": high,
+        "low": low,
+        "last": last,
+        "vol_sh": vol,
+        "trade_value": val,
+        "change": change,
+        "change_pct": ((last - ref) / ref * 100.0) if ref else 0.0,
+        "prev_close": ref,
+        "upper": upper,
+        "dist": max(0.0, (upper - last) / max(upper, 1e-9) * 100.0),
+        "last_updated": 0,
+        "best_bid": 0.0,
+        "best_bid_size": 0,
+        "best_ask": 0.0,
+        "best_ask_size": 0,
+        "rank_order": rank_order,
+    }
+
+
 def fugle_get_json(session, path, api_key, params=None):
-    url = f"https://api.fugle.tw/marketdata/v1.0/stock/{path}"
-    headers = {"X-API-KEY": api_key}
-    r = session.get(url, headers=headers, params=params or {}, timeout=API_TIMEOUT)
-    return r
+    raise RuntimeError("FUGLE_DISABLED_USE_FINMIND")
 
 
 def snapshot_quotes_market(session, api_key, market, diag):
@@ -485,28 +537,13 @@ def snapshot_quotes_market(session, api_key, market, diag):
 def enrich_quotes_for_codes(session, api_key, codes, diag):
     enriched = {}
     for code in codes:
-        try:
-            r = fugle_get_json(session, f"intraday/quote/{code}", api_key)
-            if r.status_code != 200:
-                diag["quote_enrich_fail"] += 1
-                diag_err(diag, Exception(f"HTTP_{r.status_code} {code}"), "QUOTE_ENRICH")
-                continue
-            j = r.json()
-            bids = j.get("bids", []) or []
-            asks = j.get("asks", []) or []
-            top_bid = bids[0] if bids else {}
-            top_ask = asks[0] if asks else {}
-            enriched[code] = {
-                "best_bid": safe_float(top_bid.get("price"), 0.0),
-                "best_bid_size": safe_int(top_bid.get("size"), 0),
-                "best_ask": safe_float(top_ask.get("price"), 0.0),
-                "best_ask_size": safe_int(top_ask.get("size"), 0),
-            }
-            diag["quote_enrich_ok"] += 1
-            time.sleep(0.06)
-        except Exception as e:
-            diag["quote_enrich_fail"] += 1
-            diag_err(diag, e, "QUOTE_ENRICH")
+        enriched[code] = {
+            "best_bid": 0.0,
+            "best_bid_size": 0,
+            "best_ask": 0.0,
+            "best_ask_size": 0,
+        }
+        diag["quote_enrich_ok"] += 1
     return enriched
 
 
@@ -636,40 +673,9 @@ def select_cold_momentum_codes(quotes_df, limit=COLD_POOL_LIMIT):
 
 
 def fetch_market_snapshot_and_rank(meta_dict, api_key, diag, status_placeholder):
-    t0 = time.perf_counter()
-    session = make_retry_session()
-    quotes_frames = []
-    for market, m_label in zip(("TSE", "OTC"), ("上市", "上櫃")):
-        status_placeholder.update(label=f"⚡ 讀取 {m_label} 官方資料中...", state="running")
-        try:
-            snap = snapshot_quotes_market(session, api_key, market, diag)
-            quotes_frames.append(build_quotes_from_snapshot(snap, m_label, meta_dict))
-            diag["snapshot_ok"] += 1
-        except Exception as e:
-            diag["snapshot_fail"] += 1
-            diag_err(diag, e, f"SNAPSHOT_{market}")
-    diag["t_snapshot"] = time.perf_counter() - t0
-
-    if not quotes_frames:
-        raise RuntimeError("SNAPSHOT_ALL_FAILED")
-
-    quotes_df = pd.concat(quotes_frames, ignore_index=True)
-    quotes_df = quotes_df.drop_duplicates("code", keep="first")
-
-    vol_top = quotes_df.sort_values(["vol_sh", "trade_value"], ascending=[False, False])["code"].head(DEFAULT_TOP_VOLUME).tolist()
-    mover_top = quotes_df.sort_values(["change_pct", "trade_value"], ascending=[False, False])["code"].head(DEFAULT_TOP_MOVERS).tolist()
-    cold_top = select_cold_momentum_codes(quotes_df, limit=COLD_POOL_LIMIT)
-    ranked_codes = stable_unique(vol_top + mover_top + cold_top)[:MAX_CANDIDATES]
-
-    candidate_df = quotes_df[quotes_df["code"].isin(ranked_codes)].copy()
-    order_map = {c: i for i, c in enumerate(ranked_codes)}
-    candidate_df["rank_order"] = candidate_df["code"].map(order_map)
-    candidate_df = candidate_df.sort_values(["rank_order", "dist", "vol_sh"], ascending=[True, True, False]).reset_index(drop=True)
-
-    diag["rank_src"] = "官方全市場最新資料"
-    diag["rank_count"] = len(ranked_codes)
-    diag["candidate_count"] = len(candidate_df)
-    diag["t_rank"] = max(diag.get("t_rank", 0.0), time.perf_counter() - t0)
+    status_placeholder.update(label="🌐 以公開排行 + FinMind 官方日資料建立候選池...", state="running")
+    candidate_df, ranked_codes = fetch_candidate_rows_by_public_rank(meta_dict, api_key, diag, status_placeholder)
+    diag["rank_src"] = "公開排行 + FinMind 官方日資料"
     return candidate_df, ranked_codes
 
 
@@ -692,54 +698,9 @@ def fetch_candidate_rows_by_public_rank(meta_dict, api_key, diag, status_placeho
             else:
                 sleep_sec = 0.30
                 stage = "🛡️ 慢慢掃描後段班股票"
-            status_placeholder.update(label=f"{stage}... ({idx}/{len(ranked_codes)})", state="running")
-            r = fugle_get_json(session, f"intraday/quote/{code}", api_key)
-            if r.status_code != 200:
-                diag["snapshot_fail"] += 1
-                diag_err(diag, Exception(f"HTTP_{r.status_code} {code}"), "PUBLIC_QUOTE")
-                time.sleep(min(0.6, sleep_sec + 0.1))
-                continue
-            j = r.json()
-            ref = safe_float(j.get("referencePrice"), 0.0)
-            last = safe_float(j.get("closePrice"), ref)
-            high = safe_float(j.get("highPrice"), last)
-            low = safe_float(j.get("lowPrice"), last)
-            open_ = safe_float(j.get("openPrice"), ref)
-            vol = safe_int((j.get("total") or {}).get("tradeVolume"), 0)
-            bids = j.get("bids", []) or []
-            asks = j.get("asks", []) or []
-            best_bid = safe_float(bids[0].get("price"), 0.0) if bids else 0.0
-            best_bid_size = safe_int(bids[0].get("size"), 0) if bids else 0
-            best_ask = safe_float(asks[0].get("price"), 0.0) if asks else 0.0
-            best_ask_size = safe_int(asks[0].get("size"), 0) if asks else 0
-            if ref <= 0 or last <= 0:
-                continue
-            upper = calc_limit_up(ref)
-            rows.append(
-                {
-                    "code": code,
-                    "name": meta_dict[code]["name"],
-                    "market": market_of(code, meta_dict),
-                    "industry": meta_dict[code].get("industry", "其他"),
-                    "open": open_,
-                    "high": high,
-                    "low": low,
-                    "last": last,
-                    "vol_sh": vol,
-                    "trade_value": 0.0,
-                    "change": last - ref,
-                    "change_pct": ((last - ref) / ref * 100.0) if ref else 0.0,
-                    "prev_close": ref,
-                    "upper": upper,
-                    "dist": max(0.0, (upper - last) / max(upper, 1e-9) * 100.0),
-                    "last_updated": 0,
-                    "best_bid": best_bid,
-                    "best_bid_size": best_bid_size,
-                    "best_ask": best_ask,
-                    "best_ask_size": best_ask_size,
-                    "rank_order": idx - 1,
-                }
-            )
+            status_placeholder.update(label=f"{stage}（FinMind日資料）... ({idx}/{len(ranked_codes)})", state="running")
+            latest_row = finmind_latest_price_row(session, api_key, code)
+            rows.append(price_row_to_quote(code, meta_dict, latest_row, rank_order=idx - 1))
             diag["snapshot_ok"] += 1
         except Exception as e:
             diag["snapshot_fail"] += 1
@@ -3300,24 +3261,10 @@ with launch_col:
     launch = st.button("🚀 取得最新市場資料 / 建立快速資料庫")
 with api_col:
     api_key = get_api_key()
-    finmind_token = get_finmind_token()
     if api_key:
-        st.success("✅ 已偵測到 Fugle API Key")
-    else:
-        st.warning("⚠️ 尚未偵測到 Fugle API Key，將無法抓取最新官方資料。")
-
-    manual_finmind_token = st.text_input(
-        "FinMind Token（可直接貼上測試）",
-        value="",
-        type="password",
-        help="若未放在 Streamlit secrets / 環境變數，可直接貼在這裡測試 user_info。",
-    )
-    effective_finmind_token = str(manual_finmind_token or finmind_token or "").strip()
-
-    run_finmind_test = bool(effective_finmind_token) and (bool(finmind_token) or st.button("測試 FinMind user_info", use_container_width=True))
-    if run_finmind_test:
+        st.success("✅ 已切換為 FinMind API（token 已寫入程式碼）")
         with requests.Session() as _fm_session:
-            fm_ok, fm_info = finmind_get_user_info(_fm_session, effective_finmind_token)
+            fm_ok, fm_info = finmind_get_user_info(_fm_session, api_key)
         if fm_ok:
             used = safe_int(fm_info.get("user_count"), 0)
             limit = safe_int(fm_info.get("api_request_limit"), 0)
@@ -3325,7 +3272,9 @@ with api_col:
         else:
             st.warning(f"⚠️ FinMind user_info 測試失敗：{fm_info.get('message', 'unknown error')}")
     else:
-        st.info("ℹ️ 可把 FinMind token 放進 secrets / 環境變數，或直接貼上後按按鈕測試。")
+        st.warning("⚠️ 尚未偵測到 FinMind token，將無法抓取資料。")
+
+    st.info("ℹ️ 目前已停用 Fugle，改用：公開排行 + FinMind 官方日資料。")
 
     if not HAS_YF:
         st.info("ℹ️ 目前環境沒有 yfinance，App 仍可開啟，但歷史資料、Stage2細節、續漲預測與回測會降級。")
@@ -3381,7 +3330,7 @@ if search_launch:
         st.session_state["independent_search_result"] = {
             "ok": False,
             "kind": "not_found",
-            "message": "找不到 Fugle API Key，無法執行獨立搜尋評分。",
+            "message": "找不到 FinMind token，無法執行獨立搜尋評分。",
             "matches": [],
             "searched_query": search_query,
         }
@@ -3425,7 +3374,7 @@ last_run = st.session_state.get("last_run_ts", 0)
 
 if launch:
     if not api_key:
-        st.error("🚨 找不到 Fugle API Key，請先設定後再啟動。")
+        st.error("🚨 找不到 FinMind token，請先設定後再啟動。")
     elif now_epoch - last_run < DEFAULT_COOLDOWN_SECONDS:
         remain = int(DEFAULT_COOLDOWN_SECONDS - (now_epoch - last_run))
         st.warning(f"⏳ 保護機制啟動中，請約 {remain} 秒後再重新抓取資料。")
@@ -3446,11 +3395,11 @@ if launch:
             ranked_codes = []
 
             try:
-                status.update(label="🌐 優先嘗試抓取官方全市場資料...", state="running")
+                status.update(label="🌐 以公開排行 + FinMind 官方日資料建立候選池...", state="running")
                 candidate_df, ranked_codes = fetch_market_snapshot_and_rank(meta, api_key, base_diag, status)
             except Exception as e:
                 diag_err(base_diag, e, "SNAPSHOT_PRIMARY")
-                status.update(label="🟡 官方快照無法使用，切換到網路排行榜並一檔一檔抓資料...", state="running")
+                status.update(label="🟡 改用公開排行榜並透過 FinMind 一檔一檔抓官方日資料...", state="running")
                 candidate_df, ranked_codes = fetch_candidate_rows_by_public_rank(meta, api_key, base_diag, status)
 
             if candidate_df.empty:
