@@ -2736,6 +2736,24 @@ def build_reason_tags(row):
         tags.append(str(row.get("保底補位")))
     return "｜".join(tags[:4]) if tags else "先看分數與位置"
 
+def _ma_signal_meta(item: dict):
+    first5 = safe_int(item.get("第一天站穩5MA", 0), 0)
+    on5 = safe_int(item.get("站上5MA", 0), 0)
+    state10 = str(item.get("10MA狀態", "守住"))
+    if first5 >= 1 and state10 == "守住":
+        return "首站穩5MA｜10MA守住", "sig-green", 5
+    if on5 >= 1 and state10 == "守住":
+        return "站穩5MA｜10MA守住", "sig-blue", 4
+    if state10 == "輕度轉弱":
+        return "5MA待確認｜10MA輕轉弱", "sig-yellow", 2
+    return "結構走弱｜10MA正式失守", "sig-red", 0
+
+
+def _ma_signal_html(item: dict) -> str:
+    label, css_cls, _ = _ma_signal_meta(item)
+    return f"<div class='signal-chip {css_cls}'>{html.escape(label)}</div>"
+
+
 def render_search_result_box(search_result):
     if not search_result:
         return
