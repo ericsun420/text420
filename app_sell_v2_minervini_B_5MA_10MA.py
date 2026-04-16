@@ -822,6 +822,13 @@ def _build_trend_template_features(past_df):
         "first_reclaim_5ma": first_reclaim_5ma,
         "near_10ma": near_10ma,
         "day_close_pos": day_close_pos,
+        "ma5_slope": ma5_slope,
+        "vol_ratio5": vol_ratio5,
+        "dist_ma5_pct": dist_ma5_pct,
+        "dist_ma10_pct": dist_ma10_pct,
+        "resistance_room_pct": resistance_room_pct,
+        "near_breakout": near_breakout,
+        "below10_streak": below10_streak,
         "ma50_prev20": ma50_prev20,
         "ma200_prev20": ma200_prev20,
         "ma50_slope_pct": ((ma50 / ma50_prev20 - 1.0) * 100.0) if ma50 > 0 and ma50_prev20 > 0 else 0.0,
@@ -1187,7 +1194,7 @@ def fetch_single_quote_row(session, api_key, code, meta_dict):
     }
 
 
-def evaluate_candidate_record(r, feat, now_ts, is_test, use_bloodline, only_tse, min_board, use_trend_template=DEFAULT_USE_TREND_TEMPLATE, account_size=DEFAULT_ACCOUNT_SIZE, risk_per_trade_pct=DEFAULT_RISK_PER_TRADE_PCT, free_roll_trigger_r=DEFAULT_FREE_ROLL_TRIGGER_R):
+def evaluate_candidate_record(r, feat, now_ts, is_test, use_bloodline, only_tse, min_board, bloodline_regime="normal", use_trend_template=DEFAULT_USE_TREND_TEMPLATE, account_size=DEFAULT_ACCOUNT_SIZE, risk_per_trade_pct=DEFAULT_RISK_PER_TRADE_PCT, free_roll_trigger_r=DEFAULT_FREE_ROLL_TRIGGER_R):
     code = r["code"]
     name = r["name"]
     market = r.get("market", "上市")
@@ -1213,6 +1220,11 @@ def evaluate_candidate_record(r, feat, now_ts, is_test, use_bloodline, only_tse,
     close_above_10 = bool(feat.get("close_above_10", False))
     first_reclaim_5ma = bool(feat.get("first_reclaim_5ma", False))
     near_10ma = bool(feat.get("near_10ma", False))
+    below10_streak = safe_int(feat.get("below10_streak"), 0)
+    dist_ma5_pct = safe_float(feat.get("dist_ma5_pct"), 0.0)
+    dist_ma10_pct = safe_float(feat.get("dist_ma10_pct"), 0.0)
+    vol_ratio5 = safe_float(feat.get("vol_ratio5"), 0.0)
+    ma5_slope = safe_float(feat.get("ma5_slope"), 0.0)
     stage2_pass = bool(feat.get("trend_template_pass", False))
     stage2_score = safe_int(feat.get("trend_template_score", 0), 0)
     stage2_note = str(feat.get("trend_template_note", "資料不足"))
@@ -1249,13 +1261,23 @@ def evaluate_candidate_record(r, feat, now_ts, is_test, use_bloodline, only_tse,
     if first_reclaim_5ma:
         score += 1.15
     elif close_above_5:
-        score += 0.40
+        score += 0.30
     else:
         score -= 0.55
+
+    if not close_above_5 and ma5_slope < -0.003:
+        score -= 0.20
+
+    if (dist_ma5_pct > 4.2) or (dist_ma10_pct > 8.5):
+        score -= 0.55
+
     if close_above_10:
         score += 0.35
     else:
-        score -= 0.75
+        if below10_streak >= 2 or (vol_ratio5 >= 1.35 and not close_above_5):
+            score -= 1.00
+        else:
+            score -= 0.30
     if stage2_pass:
         score += 1.0
     elif not hist_missing:
@@ -1302,10 +1324,18 @@ def evaluate_candidate_record(r, feat, now_ts, is_test, use_bloodline, only_tse,
         risk_count += 1
         risk_flags.append("未站穩 5MA")
 
-    if not close_above_10:
-        score -= 0.25
+    if (dist_ma5_pct > 4.2) or (dist_ma10_pct > 8.5):
         risk_count += 1
-        risk_flags.append("跌破 10MA 防守")
+        risk_flags.append("短線乖離過大")
+
+    if not close_above_10:
+        if below10_streak >= 2 or (vol_ratio5 >= 1.35 and not close_above_5):
+            score -= 0.30
+            risk_count += 2
+            risk_flags.append("10MA 正式失守")
+        else:
+            risk_count += 1
+            risk_flags.append("10MA 輕度轉弱")
     elif near_10ma:
         score += 0.10
 
@@ -1315,16 +1345,23 @@ def evaluate_candidate_record(r, feat, now_ts, is_test, use_bloodline, only_tse,
         risk_flags.append("跌回 50MA 下方")
 
     bloodline_note = ""
+    if bloodline_regime == "hot":
+        bloodline_strong_bonus, bloodline_mid_bonus, bloodline_weak_penalty = 1.05, 0.55, (0.18 if not is_test else 0.06)
+    elif bloodline_regime == "cold":
+        bloodline_strong_bonus, bloodline_mid_bonus, bloodline_weak_penalty = 0.55, 0.20, (0.45 if not is_test else 0.18)
+    else:
+        bloodline_strong_bonus, bloodline_mid_bonus, bloodline_weak_penalty = 0.85, 0.40, (0.35 if not is_test else 0.12)
+
     if use_bloodline:
         if board_streak >= max(2, min_board + 1):
-            score += 0.85
+            score += bloodline_strong_bonus
             bloodline_note = "｜血統強"
             risk_count = max(0, risk_count - 1)
         elif board_streak >= min_board:
-            score += 0.40
+            score += bloodline_mid_bonus
             bloodline_note = "｜血統穩"
         else:
-            score -= 0.35 if not is_test else 0.12
+            score -= bloodline_weak_penalty
             risk_flags.append("血統偏弱")
             risk_count += 1
             bloodline_note = "｜新起漲"
@@ -1400,11 +1437,11 @@ def evaluate_candidate_record(r, feat, now_ts, is_test, use_bloodline, only_tse,
 
     if use_bloodline:
         if board_streak >= max(2, min_board + 1):
-            breakout_score += 0.25
+            breakout_score += bloodline_strong_bonus * 0.22
         elif board_streak >= min_board:
-            breakout_score += 0.12
+            breakout_score += bloodline_mid_bonus * 0.18
         else:
-            breakout_score -= 0.12 if not is_test else 0.05
+            breakout_score -= bloodline_weak_penalty * 0.18
     else:
         if board_streak == 0:
             breakout_score += 0.45
@@ -1474,6 +1511,8 @@ def evaluate_candidate_record(r, feat, now_ts, is_test, use_bloodline, only_tse,
         "第一天站穩5MA": 1 if first_reclaim_5ma else 0,
         "站上5MA": 1 if close_above_5 else 0,
         "站上10MA": 1 if close_above_10 else 0,
+        "10MA狀態": ("正式失守" if ((not close_above_10) and (below10_streak >= 2 or (vol_ratio5 >= 1.35 and not close_above_5))) else ("輕度轉弱" if not close_above_10 else "守住")),
+        "血統權重模式": {"hot": "熱盤", "normal": "正常", "cold": "冷盤"}.get(bloodline_regime, "正常"),
         "5MA": round(ma5, 2) if ma5 > 0 else 0.0,
         "10MA": round(ma10, 2) if ma10 > 0 else 0.0,
         "50MA": round(ma50, 2) if ma50 > 0 else 0.0,
@@ -1838,6 +1877,19 @@ def apply_dynamic_filters(raw_df, feature_cache, now_ts, is_test, use_bloodline,
         return pd.DataFrame(), stats, diag
 
     work = raw_df.copy()
+    chg_s_all = work.get("change_pct", pd.Series([0.0] * len(work), index=work.index)).astype(float)
+    heat_s_all = work.get("heat", pd.Series([1.0] * len(work), index=work.index)).astype(float)
+    hot_ratio = float((chg_s_all >= 3.0).mean()) if len(work) else 0.0
+    cold_ratio = float((chg_s_all <= 0.5).mean()) if len(work) else 0.0
+    median_chg = float(chg_s_all.median()) if len(work) else 0.0
+    median_heat = float(heat_s_all.median()) if len(work) else 1.0
+    if hot_ratio >= 0.28 and median_chg >= 1.6 and median_heat >= 1.05:
+        bloodline_regime = "hot"
+    elif hot_ratio <= 0.12 and (median_chg <= 0.8 or cold_ratio >= 0.45):
+        bloodline_regime = "cold"
+    else:
+        bloodline_regime = "normal"
+
     if only_tse:
         work = work[work["market"] == "上市"].copy()
 
@@ -1874,6 +1926,7 @@ def apply_dynamic_filters(raw_df, feature_cache, now_ts, is_test, use_bloodline,
             use_bloodline=use_bloodline,
             only_tse=only_tse,
             min_board=min_board,
+            bloodline_regime=bloodline_regime,
         )
         if not assessment.get("passed"):
             if assessment.get("reason_key") == "資訊不足":
@@ -1929,6 +1982,10 @@ def apply_dynamic_filters(raw_df, feature_cache, now_ts, is_test, use_bloodline,
             res["站上10MA"] = 0
         if "board_val" not in res.columns:
             res["board_val"] = 0
+        res["10MA狀態"] = res.get("10MA狀態", pd.Series(["守住"] * len(res), index=res.index)).fillna("守住")
+        res["5MA燈號分"] = res["第一天站穩5MA"].astype(int) * 2 + res["站上5MA"].astype(int)
+        res["10MA燈號分"] = res["10MA狀態"].map({"守住": 2, "輕度轉弱": 1, "正式失守": 0}).fillna(1).astype(int)
+        res["結構燈號分"] = res["5MA燈號分"].astype(int) * 10 + res["10MA燈號分"].astype(int)
         res["模式排序分"] = (
             res["今日表現分數"].astype(float)
             + res["起漲雷達分數"].astype(float) * 0.72
@@ -1953,8 +2010,8 @@ def apply_dynamic_filters(raw_df, feature_cache, now_ts, is_test, use_bloodline,
             res.loc[res["風險數"].astype(int) <= 3, "模式排序分"] += 0.12
 
         res = res.sort_values(
-            ["模式排序分", "今日表現分數", "推薦星等", "交易熱度", "board_val", "距離最高價%"],
-            ascending=[False, False, False, False, False, True],
+            ["結構燈號分", "模式排序分", "今日表現分數", "推薦星等", "交易熱度", "board_val", "距離最高價%"],
+            ascending=[False, False, False, False, False, False, True],
         ).reset_index(drop=True)
 
         score = res["今日表現分數"].astype(float)
@@ -2734,6 +2791,7 @@ def render_search_result_box(search_result):
         f"<div class='card-name'>{html.escape(str(item.get('名稱', '')))} ｜ {html.escape(str(item.get('市場', '')))} ｜ {html.escape(str(item.get('產業', '其他')))}</div>",
         f"<div class='card-price'>{safe_float(item.get('現價', 0.0), 0.0):.2f}</div>",
         f"<div class='card-status'>{html.escape(str(item.get('狀態', '')))}</div>",
+        _ma_signal_html(item),
         f"<div class='card-predict'>Stage2：{stage2_text}｜{stage2_note}</div>",
         f"<div class='card-predict-note'>{risk_line}</div>",
         f"<div class='card-predict'>{html.escape(str(item.get('預測主句', '白話預測：暫時沒有足夠資料')))}</div>",
@@ -2751,6 +2809,8 @@ def render_search_result_box(search_result):
         f"<div class='stat-pill'><div class='stat-k'>交易熱度</div><div class='stat-v'>{safe_float(item.get('交易熱度', 0.0), 0.0):.2f}x</div></div>",
         f"<div class='stat-pill'><div class='stat-k'>距最高價</div><div class='stat-v'>{safe_float(item.get('距離最高價%', 0.0), 0.0):.2f}%</div></div>",
         f"<div class='stat-pill'><div class='stat-k'>Stage2</div><div class='stat-v'>{stage2_text}</div></div>",
+        f"<div class='stat-pill'><div class='stat-k'>5MA</div><div class='stat-v'>{'首站穩' if safe_int(item.get('第一天站穩5MA', 0), 0) >= 1 else ('站上' if safe_int(item.get('站上5MA', 0), 0) >= 1 else '未站穩')}</div></div>",
+        f"<div class='stat-pill'><div class='stat-k'>10MA</div><div class='stat-v'>{html.escape(str(item.get('10MA狀態', '守住')))}</div></div>",
         f"<div class='stat-pill'><div class='stat-k'>建議停損</div><div class='stat-v'>{safe_float(item.get('建議停損價', 0.0), 0.0):.2f}</div></div>",
         f"<div class='stat-pill'><div class='stat-k'>Free Roll</div><div class='stat-v'>{safe_float(item.get('Free Roll觸發價', 0.0), 0.0):.2f}</div></div>",
         f"<div class='stat-pill'><div class='stat-k'>50MA 防守</div><div class='stat-v'>{safe_float(item.get('50MA防守價', 0.0), 0.0):.2f}</div></div>",
@@ -2784,6 +2844,7 @@ def render_stock_cards(section_df: pd.DataFrame, empty_text: str):
   <div class="card-name">{row.get('名稱', '')} ｜ {row.get('市場', '')} ｜ {row.get('產業', '其他')}</div>
   <div class="card-price">{safe_float(row.get('現價', 0.0), 0.0):.2f}</div>
   <div class="card-status">{row.get('狀態', '')}</div>
+  {_ma_signal_html(row)}
 
   <div class="card-predict">Stage2：{stage2_text}｜{stage2_note}</div>
   <div class="card-predict-note">{risk_line}</div>
@@ -2800,6 +2861,8 @@ def render_stock_cards(section_df: pd.DataFrame, empty_text: str):
     <div class="stat-pill"><div class="stat-k">交易熱度</div><div class="stat-v">{safe_float(row.get('交易熱度', 0.0), 0.0):.2f}x</div></div>
     <div class="stat-pill"><div class="stat-k">距最高價</div><div class="stat-v">{safe_float(row.get('距離最高價%', 0.0), 0.0):.2f}%</div></div>
     <div class="stat-pill"><div class="stat-k">Stage2</div><div class="stat-v">{stage2_text}</div></div>
+    <div class="stat-pill"><div class="stat-k">5MA</div><div class="stat-v">{'首站穩' if safe_int(row.get('第一天站穩5MA', 0), 0) >= 1 else ('站上' if safe_int(row.get('站上5MA', 0), 0) >= 1 else '未站穩')}</div></div>
+    <div class="stat-pill"><div class="stat-k">10MA</div><div class="stat-v">{html.escape(str(row.get('10MA狀態', '守住')))}</div></div>
     <div class="stat-pill"><div class="stat-k">建議停損</div><div class="stat-v">{safe_float(row.get('建議停損價', 0.0), 0.0):.2f}</div></div>
     <div class="stat-pill"><div class="stat-k">Free Roll</div><div class="stat-v">{safe_float(row.get('Free Roll觸發價', 0.0), 0.0):.2f}</div></div>
     <div class="stat-pill"><div class="stat-k">50MA 防守</div><div class="stat-v">{safe_float(row.get('50MA防守價', 0.0), 0.0):.2f}</div></div>
@@ -2935,6 +2998,11 @@ st.markdown(
 .card-name {font-size: 14px; color: #a7b7b0; font-weight: 700; margin-top: 2px;}
 .card-price {font-size: 38px; font-weight: 950; color: #f1f6f2; margin-top: 14px; letter-spacing: -1px;}
 .card-status {font-size: 13px; color: #d4e0da; font-weight: 700; margin-top: 10px;}
+.signal-chip {display:inline-flex; align-items:center; gap:8px; margin-top:10px; padding:6px 10px; border-radius:999px; font-size:12px; font-weight:900; letter-spacing:.2px; border:1px solid rgba(255,255,255,.08);}
+.sig-green {background: rgba(38, 92, 67, .32); color:#bdf0cf;}
+.sig-blue {background: rgba(49, 78, 122, .30); color:#c8ddff;}
+.sig-yellow {background: rgba(119, 94, 36, .28); color:#ffe5a8;}
+.sig-red {background: rgba(117, 44, 44, .28); color:#ffb8b8;}
 .card-stars-wrap {display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top: 14px;}
 .card-stars {font-size: 18px; letter-spacing: 1px; font-weight: 900; color: #dbc07f;}
 .card-stars-badge {font-size: 12px; color: #132026; background: linear-gradient(135deg, #dcc58c 0%, #c7ab6f 100%); border-radius: 999px; padding: 5px 10px; font-weight: 900;}
@@ -3413,9 +3481,11 @@ if "raw_data_vault_v12" in st.session_state:
             res["入選理由"] = res.apply(build_reason_tags, axis=1)
         # 族群共振在這一版正式吃進主評分後，再依新分數重排一次
         if "模式排序分" in res.columns:
+            if "結構燈號分" not in res.columns:
+                res["結構燈號分"] = 0
             res = res.sort_values(
-                ["模式分級", "模式排序分", "今日表現分數", "起漲雷達分數"],
-                ascending=[True, False, False, False]
+                ["模式分級", "結構燈號分", "模式排序分", "今日表現分數", "起漲雷達分數"],
+                ascending=[True, False, False, False, False]
             ).reset_index(drop=True)
 
     a_df = res[res["模式分級"] == "A級焦點"].copy() if not res.empty else pd.DataFrame()
