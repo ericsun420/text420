@@ -29,7 +29,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # 基本設定
 # ============================================================
 APP_TITLE = "OMEGA 趨勢起漲戰情室"
-APP_SUBTITLE = "v13.4 Stage 2 趨勢模板｜起漲雷達｜族群共振｜風控交易"
+APP_SUBTITLE = "v13.5 Clean｜Stage 2 趨勢模板｜起漲雷達｜族群共振｜風控交易"
 FUGLE_API_KEY = "ZWJjZDhjZWYtMjhhMi00YWI2LTliNWQtMmViYzVhMmIzODdjIGY1N2Y0MGZmLWQ1MjgtNDk1OC1iZTljLWMxOWUwODQ4Y2U2Zg=="
 API_TIMEOUT = (3.0, 10.0)
 PUBLIC_TIMEOUT = (3.0, 12.0)
@@ -47,6 +47,8 @@ DEFAULT_USE_TREND_TEMPLATE = True
 DEFAULT_ACCOUNT_SIZE = 1_000_000
 DEFAULT_RISK_PER_TRADE_PCT = 1.0
 DEFAULT_FREE_ROLL_TRIGGER_R = 1.0
+DATA_VAULT_KEY = "raw_data_vault_v13"
+SEARCH_RESULT_KEY = "independent_search_result"
 
 
 # ============================================================
@@ -2928,6 +2930,198 @@ def render_stock_cards(section_df: pd.DataFrame, empty_text: str):
             )
 
 
+def run_scan_pipeline(api_key, meta, is_test, use_bloodline, only_tse, min_board):
+    base_diag = diag_init()
+    t_all = time.perf_counter()
+
+    with st.status("⚡ 準備整理最新市場資訊...", expanded=True) as status:
+        t0 = time.perf_counter()
+        meta, meta_errors = get_stock_list()
+        base_diag["t_meta"] = time.perf_counter() - t0
+        base_diag["meta_count"] = len(meta)
+        for e in meta_errors:
+            diag_err(base_diag, Exception(e), "META")
+
+        candidate_df = pd.DataFrame()
+        ranked_codes = []
+
+        try:
+            status.update(label="🌐 優先嘗試抓取官方全市場資料...", state="running")
+            candidate_df, ranked_codes = fetch_market_snapshot_and_rank(meta, api_key, base_diag, status)
+        except Exception as e:
+            diag_err(base_diag, e, "SNAPSHOT_PRIMARY")
+            status.update(label="🟡 官方快照無法使用，切換到網路排行榜並一檔一檔抓資料...", state="running")
+            candidate_df, ranked_codes = fetch_candidate_rows_by_public_rank(meta, api_key, base_diag, status)
+
+        if candidate_df.empty:
+            status.update(label="❌ 無法取得股票資料，請檢查網路連線或 API 設定。", state="error")
+            return None
+
+        feature_cache, raw_daily = compute_feature_cache(candidate_df, meta, base_diag, status, period=f"{RAW_HISTORY_DAYS}d")
+
+        now_ts = now_taipei()
+        pre_res, _, _ = apply_dynamic_filters(
+            raw_df=candidate_df,
+            feature_cache=feature_cache,
+            now_ts=now_ts,
+            is_test=is_test,
+            use_bloodline=use_bloodline,
+            only_tse=only_tse,
+            min_board=min_board,
+            base_diag=base_diag,
+        )
+
+        enrich_codes = stable_unique(
+            (pre_res["代號"].head(FINAL_ENRICH_LIMIT).tolist() if not pre_res.empty else [])
+            + candidate_df.sort_values(["dist", "vol_sh"], ascending=[True, False])["code"].head(FINAL_ENRICH_LIMIT).tolist()
+        )[:FINAL_ENRICH_LIMIT]
+
+        if enrich_codes:
+            status.update(label="🧠 補強重點候選名單的買賣排隊狀況...", state="running")
+            t_enrich = time.perf_counter()
+            session = make_retry_session()
+            enrich_map = enrich_quotes_for_codes(session, api_key, enrich_codes, base_diag)
+            base_diag["t_enrich"] = time.perf_counter() - t_enrich
+            if enrich_map:
+                for k, v in enrich_map.items():
+                    for field, value in v.items():
+                        candidate_df.loc[candidate_df["code"] == k, field] = value
+        else:
+            base_diag["t_enrich"] = 0.0
+
+        base_diag["total"] = time.perf_counter() - t_all
+        status.update(label="✅ 資料庫已建立完成。之後切換開關不需要重抓，會直接用現有資料運算。", state="complete")
+
+    return {
+        "meta": meta,
+        "candidate_df": candidate_df,
+        "feature_cache": feature_cache,
+        "raw_daily": raw_daily,
+        "ranked_codes": ranked_codes,
+        "base_diag": base_diag,
+        "ts": now_taipei(),
+    }
+
+
+def compute_dashboard_bundle(vault, is_test, use_bloodline, only_tse, min_board, hold_days):
+    t_filter = time.perf_counter()
+    res, stats, final_diag = apply_dynamic_filters(
+        raw_df=vault["candidate_df"],
+        feature_cache=vault["feature_cache"],
+        now_ts=vault["ts"],
+        is_test=is_test,
+        use_bloodline=use_bloodline,
+        only_tse=only_tse,
+        min_board=min_board,
+        base_diag=vault["base_diag"],
+    )
+
+    if not res.empty:
+        res = attach_continuation_prediction(
+            res_df=res,
+            raw_daily=vault["raw_daily"],
+            meta_dict=vault["meta"],
+        )
+
+    final_diag["t_filter"] = time.perf_counter() - t_filter
+
+    bt_t0 = time.perf_counter()
+    bt_universe = pick_backtest_universe(vault["candidate_df"], top_n=28)
+    bt_df, bt_stats = run_surrogate_backtest(
+        raw_daily=vault["raw_daily"],
+        universe_codes=bt_universe,
+        meta_dict=vault["meta"],
+        lookback_days=126,
+        hold_days=hold_days,
+        use_bloodline=use_bloodline,
+        min_board=min_board,
+        is_test=is_test,
+    )
+    final_diag["t_backtest"] = time.perf_counter() - bt_t0
+
+    return {
+        "res": res,
+        "stats": stats,
+        "diag": final_diag,
+        "bt_df": bt_df,
+        "bt_stats": bt_stats,
+    }
+
+
+def prepare_result_views(res: pd.DataFrame):
+    if res is None or res.empty:
+        empty = pd.DataFrame()
+        return empty, empty, empty, empty, [], []
+
+    res = res.copy()
+    if "模式分級" not in res.columns:
+        if "分級" in res.columns:
+            res["模式分級"] = res["分級"].fillna("C級候補")
+        else:
+            res["模式分級"] = "C級候補"
+
+    res["入選理由"] = res.apply(build_reason_tags, axis=1)
+
+    if "模式排序分" in res.columns:
+        if "結構燈號分" not in res.columns:
+            res["結構燈號分"] = 0
+        res = res.sort_values(
+            ["模式分級", "結構燈號分", "模式排序分", "今日表現分數", "起漲雷達分數"],
+            ascending=[True, False, False, False, False]
+        ).reset_index(drop=True)
+
+    a_df = res[res["模式分級"] == "A級焦點"].copy()
+    b_df = res[res["模式分級"] == "B級觀察"].copy()
+    c_df = res[res["模式分級"] == "C級候補"].copy()
+
+    fallback_badges = []
+    if not a_df.empty and "保底補位" in a_df.columns and (a_df["保底補位"] != "").any():
+        fallback_badges.append("A 含保底補位")
+    if not b_df.empty and "保底補位" in b_df.columns and (b_df["保底補位"] != "").any():
+        fallback_badges.append("B 含保底補位")
+
+    strong_groups = []
+    if "產業" in res.columns:
+        group_df = res[res["模式分級"].isin(["A級焦點", "B級觀察", "C級候補"])].copy()
+        if not group_df.empty:
+            industry_top = group_df.groupby("產業")["同族群跟漲數"].max().sort_values(ascending=False)
+            strong_groups = [f"{ind} 跟漲{cnt}檔" for ind, cnt in industry_top.items() if cnt >= 1][:4]
+
+    return res, a_df, b_df, c_df, fallback_badges, strong_groups
+
+
+def render_dashboard_summary(ts, is_test, use_bloodline, final_diag, bt_stats):
+    state_str = f"B版：5MA首站穩強化／10MA防守輔助 ｜ 放寬模式 {'開啟' if is_test else '關閉'} ｜ 血統加分 {'開啟（降權）' if use_bloodline else '關閉'} ｜ Stage2模板 預設開啟"
+    st.markdown(
+        f"<div class='soft-note'>資料時間：{ts.strftime('%Y-%m-%d %H:%M:%S')}（台灣時間）｜{state_str}｜重新篩選只花：{final_diag['t_filter']:.3f}秒</div>",
+        unsafe_allow_html=True,
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("初始清單數量", f"{final_diag.get('candidate_count', 0)} 檔", f"資料來源：{final_diag.get('rank_src', '未知')}")
+    m2.metric("通過嚴格標準", f"{final_diag.get('passed_filter', 0)} 檔", f"成功取得即時資料數：{final_diag.get('snapshot_ok', 0)}")
+    coverage = f"{final_diag.get('feature_ok', 0)} / {final_diag.get('candidate_count', 0)}"
+    m3.metric("歷史資料庫完整度", coverage, f"成功下載過去資料數：{final_diag.get('yf_returned', 0)}")
+    m4.metric("歷史模擬勝率", f"{bt_stats['win_rate']}%", f"過去出現過的機會：{bt_stats['signals']} 次")
+
+
+def render_diagnostics_panel(final_diag):
+    if not final_diag:
+        return
+
+    last_errors = list(final_diag.get("last_errors", []))
+    with st.expander("🩺 執行診斷", expanded=False):
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Meta", final_diag.get("meta_count", 0), f"{final_diag.get('t_meta', 0.0):.2f}s")
+        d2.metric("Snapshot OK", final_diag.get("snapshot_ok", 0), f"失敗 {final_diag.get('snapshot_fail', 0)}")
+        d3.metric("Feature OK", final_diag.get("feature_ok", 0), f"失敗 {final_diag.get('feature_fail', 0)}")
+        d4.metric("總耗時", f"{final_diag.get('total', 0.0):.2f}s", f"回測 {final_diag.get('t_backtest', 0.0):.2f}s")
+        if last_errors:
+            st.code("\n".join(last_errors), language="text")
+        else:
+            st.caption("目前沒有記錄到最近錯誤。")
+
+
 st.set_page_config(page_title=APP_TITLE, page_icon="⚡", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown(
@@ -3319,11 +3513,11 @@ with st.form("independent_search_form", clear_on_submit=False):
 st.caption("輸入後按 Enter 也可直接搜尋；清除會一起移除目前結果。")
 st.markdown('</div>', unsafe_allow_html=True)
 
-vault_for_search = st.session_state.get("raw_data_vault_v12")
+vault_for_search = st.session_state.get(DATA_VAULT_KEY)
 if clear_search:
     st.session_state["independent_search_text"] = ""
     st.session_state["independent_search_widget_version"] += 1
-    st.session_state.pop("independent_search_result", None)
+    st.session_state.pop(SEARCH_RESULT_KEY, None)
     st.rerun()
 
 if search_launch:
@@ -3332,7 +3526,7 @@ if search_launch:
     api_key_search = get_api_key()
     meta_search, meta_errors = get_meta_for_search(vault_for_search)
     if not search_query:
-        st.session_state["independent_search_result"] = {
+        st.session_state[SEARCH_RESULT_KEY] = {
             "ok": False,
             "kind": "not_found",
             "message": "請先輸入股票代號或名稱。",
@@ -3340,7 +3534,7 @@ if search_launch:
             "searched_query": search_query,
         }
     elif not api_key_search:
-        st.session_state["independent_search_result"] = {
+        st.session_state[SEARCH_RESULT_KEY] = {
             "ok": False,
             "kind": "not_found",
             "message": "找不到 Fugle API Key，無法執行獨立搜尋評分。",
@@ -3349,7 +3543,7 @@ if search_launch:
         }
     elif not meta_search:
         err_text = meta_errors[0] if meta_errors else "股票清單讀取失敗，請稍後再試。"
-        st.session_state["independent_search_result"] = {
+        st.session_state[SEARCH_RESULT_KEY] = {
             "ok": False,
             "kind": "not_found",
             "message": err_text,
@@ -3359,7 +3553,7 @@ if search_launch:
     else:
         try:
             with st.status("🔎 搜尋指定股票並套用同一套評分模型...", expanded=False):
-                st.session_state["independent_search_result"] = evaluate_single_search(
+                st.session_state[SEARCH_RESULT_KEY] = evaluate_single_search(
                     query=search_query,
                     meta_dict=meta_search,
                     api_key=api_key_search,
@@ -3370,7 +3564,7 @@ if search_launch:
                     vault=vault_for_search,
                 )
         except Exception as e:
-            st.session_state["independent_search_result"] = {
+            st.session_state[SEARCH_RESULT_KEY] = {
                 "ok": False,
                 "kind": "not_found",
                 "message": f"搜尋評分失敗：{e}",
@@ -3378,7 +3572,7 @@ if search_launch:
                 "searched_query": search_query,
             }
 
-search_result = st.session_state.get("independent_search_result")
+search_result = st.session_state.get(SEARCH_RESULT_KEY)
 if search_result:
     render_search_result_box(search_result)
 
@@ -3393,169 +3587,43 @@ if launch:
         st.warning(f"⏳ 保護機制啟動中，請約 {remain} 秒後再重新抓取資料。")
     else:
         st.session_state["last_run_ts"] = now_epoch
-        base_diag = diag_init()
-        t_all = time.perf_counter()
+        scan_vault = run_scan_pipeline(
+            api_key=api_key,
+            meta=None,
+            is_test=is_test,
+            use_bloodline=use_bloodline,
+            only_tse=only_tse,
+            min_board=min_board,
+        )
+        if scan_vault is not None:
+            st.session_state[DATA_VAULT_KEY] = scan_vault
 
-        with st.status("⚡ 準備整理最新市場資訊...", expanded=True) as status:
-            t0 = time.perf_counter()
-            meta, meta_errors = get_stock_list()
-            base_diag["t_meta"] = time.perf_counter() - t0
-            base_diag["meta_count"] = len(meta)
-            for e in meta_errors:
-                diag_err(base_diag, Exception(e), "META")
-
-            candidate_df = pd.DataFrame()
-            ranked_codes = []
-
-            try:
-                status.update(label="🌐 優先嘗試抓取官方全市場資料...", state="running")
-                candidate_df, ranked_codes = fetch_market_snapshot_and_rank(meta, api_key, base_diag, status)
-            except Exception as e:
-                diag_err(base_diag, e, "SNAPSHOT_PRIMARY")
-                status.update(label="🟡 官方快照無法使用，切換到網路排行榜並一檔一檔抓資料...", state="running")
-                candidate_df, ranked_codes = fetch_candidate_rows_by_public_rank(meta, api_key, base_diag, status)
-
-            if candidate_df.empty:
-                status.update(label="❌ 無法取得股票資料，請檢查網路連線或 API 設定。", state="error")
-                st.stop()
-
-            feature_cache, raw_daily = compute_feature_cache(candidate_df, meta, base_diag, status, period=f"{RAW_HISTORY_DAYS}d")
-
-            now_ts = now_taipei()
-            pre_res, _, pre_diag = apply_dynamic_filters(
-                raw_df=candidate_df,
-                feature_cache=feature_cache,
-                now_ts=now_ts,
-                is_test=is_test,
-                use_bloodline=use_bloodline,
-                only_tse=only_tse,
-                min_board=min_board,
-                base_diag=base_diag,
-            )
-
-            enrich_codes = stable_unique(
-                (pre_res["代號"].head(FINAL_ENRICH_LIMIT).tolist() if not pre_res.empty else [])
-                + candidate_df.sort_values(["dist", "vol_sh"], ascending=[True, False])["code"].head(FINAL_ENRICH_LIMIT).tolist()
-            )[:FINAL_ENRICH_LIMIT]
-
-            if enrich_codes:
-                status.update(label="🧠 補強重點候選名單的買賣排隊狀況...", state="running")
-                t_enrich = time.perf_counter()
-                session = make_retry_session()
-                enrich_map = enrich_quotes_for_codes(session, api_key, enrich_codes, base_diag)
-                base_diag["t_enrich"] = time.perf_counter() - t_enrich
-                if enrich_map:
-                    for k, v in enrich_map.items():
-                        for field, value in v.items():
-                            candidate_df.loc[candidate_df["code"] == k, field] = value
-            else:
-                base_diag["t_enrich"] = 0.0
-
-            base_diag["total"] = time.perf_counter() - t_all
-            status.update(label="✅ 資料庫已建立完成。之後切換開關不需要重抓，會直接用現有資料運算。", state="complete")
-
-        st.session_state["raw_data_vault_v12"] = {
-            "meta": meta,
-            "candidate_df": candidate_df,
-            "feature_cache": feature_cache,
-            "raw_daily": raw_daily,
-            "ranked_codes": ranked_codes,
-            "base_diag": base_diag,
-            "ts": now_taipei(),
-        }
-
-if "raw_data_vault_v12" in st.session_state:
-    vault = st.session_state["raw_data_vault_v12"]
-    t_filter = time.perf_counter()
-    res, stats, final_diag = apply_dynamic_filters(
-        raw_df=vault["candidate_df"],
-        feature_cache=vault["feature_cache"],
-        now_ts=vault["ts"],
+if DATA_VAULT_KEY in st.session_state:
+    vault = st.session_state[DATA_VAULT_KEY]
+    dashboard = compute_dashboard_bundle(
+        vault=vault,
         is_test=is_test,
         use_bloodline=use_bloodline,
         only_tse=only_tse,
         min_board=min_board,
-        base_diag=vault["base_diag"],
-    )
-
-    if not res.empty:
-        res = attach_continuation_prediction(
-            res_df=res,
-            raw_daily=vault["raw_daily"],
-            meta_dict=vault["meta"],
-        )
-
-    final_diag["t_filter"] = time.perf_counter() - t_filter
-
-    bt_t0 = time.perf_counter()
-    bt_universe = pick_backtest_universe(vault["candidate_df"], top_n=28)
-    bt_df, bt_stats = run_surrogate_backtest(
-        raw_daily=vault["raw_daily"],
-        universe_codes=bt_universe,
-        meta_dict=vault["meta"],
-        lookback_days=126,
         hold_days=hold_days,
-        use_bloodline=use_bloodline,
-        min_board=min_board,
-        is_test=is_test,
     )
-    final_diag["t_backtest"] = time.perf_counter() - bt_t0
 
+    res = dashboard["res"]
+    final_diag = dashboard["diag"]
+    bt_df = dashboard["bt_df"]
+    bt_stats = dashboard["bt_stats"]
     ts = vault["ts"]
-    state_str = f"B版：5MA首站穩強化／10MA防守輔助 ｜ 放寬模式 {'開啟' if is_test else '關閉'} ｜ 血統加分 {'開啟（降權）' if use_bloodline else '關閉'} ｜ Stage2模板 預設開啟"
-    st.markdown(
-        f"<div class='soft-note'>資料時間：{ts.strftime('%Y-%m-%d %H:%M:%S')}（台灣時間）｜{state_str}｜重新篩選只花：{final_diag['t_filter']:.3f}秒</div>",
-        unsafe_allow_html=True,
-    )
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("初始清單數量", f"{final_diag.get('candidate_count', 0)} 檔", f"資料來源：{final_diag.get('rank_src', '未知')}")
-    m2.metric("通過嚴格標準", f"{len(res)} 檔", f"成功取得即時資料數：{final_diag.get('snapshot_ok', 0)}")
-    coverage = f"{final_diag.get('feature_ok', 0)} / {final_diag.get('candidate_count', 0)}"
-    m3.metric("歷史資料庫完整度", coverage, f"成功下載過去資料數：{final_diag.get('yf_returned', 0)}")
-    m4.metric("歷史模擬勝率", f"{bt_stats['win_rate']}%", f"過去出現過的機會：{bt_stats['signals']} 次")
-
-
+    render_dashboard_summary(ts, is_test, use_bloodline, final_diag, bt_stats)
     st.markdown("<hr>", unsafe_allow_html=True)
 
-    if not res.empty and "模式分級" not in res.columns:
-        if "分級" in res.columns:
-            res["模式分級"] = res["分級"].fillna("C級候補")
-        else:
-            res["模式分級"] = "C級候補"
+    res, a_df, b_df, c_df, fallback_badges, strong_groups = prepare_result_views(res)
 
-    if not res.empty:
-        if "入選理由" not in res.columns:
-            res["入選理由"] = res.apply(build_reason_tags, axis=1)
-        else:
-            res["入選理由"] = res.apply(build_reason_tags, axis=1)
-        # 族群共振在這一版正式吃進主評分後，再依新分數重排一次
-        if "模式排序分" in res.columns:
-            if "結構燈號分" not in res.columns:
-                res["結構燈號分"] = 0
-            res = res.sort_values(
-                ["模式分級", "結構燈號分", "模式排序分", "今日表現分數", "起漲雷達分數"],
-                ascending=[True, False, False, False, False]
-            ).reset_index(drop=True)
-
-    a_df = res[res["模式分級"] == "A級焦點"].copy() if not res.empty else pd.DataFrame()
-    b_df = res[res["模式分級"] == "B級觀察"].copy() if not res.empty else pd.DataFrame()
-    c_df = res[res["模式分級"] == "C級候補"].copy() if not res.empty else pd.DataFrame()
-
-    fallback_badges = []
-    if not a_df.empty and "保底補位" in a_df.columns and (a_df["保底補位"] != "").any():
-        fallback_badges.append("A 含保底補位")
-    if not b_df.empty and "保底補位" in b_df.columns and (b_df["保底補位"] != "").any():
-        fallback_badges.append("B 含保底補位")
     extra_note = f"｜{' / '.join(fallback_badges)}" if fallback_badges else ""
     st.caption(f"目前分布｜A級 {len(a_df)} 檔 ｜ B級 {len(b_df)} 檔 ｜ C級 {len(c_df)} 檔{extra_note}")
-    if not res.empty and "產業" in res.columns:
-        group_df = res[res["模式分級"].isin(["A級焦點", "B級觀察", "C級候補"])].copy()
-        if not group_df.empty:
-            industry_top = group_df.groupby("產業")["同族群跟漲數"].max().sort_values(ascending=False)
-            strong_groups = [f"{ind} 跟漲{cnt}檔" for ind, cnt in industry_top.items() if cnt >= 1][:4]
-            if strong_groups:
-                st.caption("同產業同步發動｜" + " / ".join(strong_groups))
+    if strong_groups:
+        st.caption("同產業同步發動｜" + " / ".join(strong_groups))
 
     st.subheader("A級焦點")
     render_stock_cards(a_df, "今天暫時沒有衝到 A 級焦點的股票。")
@@ -3584,6 +3652,8 @@ if "raw_data_vault_v12" in st.session_state:
             st.caption("表格調整為方便閱讀的深色模式，數字靠右對齊、漲跌用顏色區分，看久了眼睛比較不會累。")
         else:
             st.info("過去 126 天內，這些股票沒有發生符合你所設定條件的情況。可能你的條件訂得太嚴格了，或是選到的清單剛好近期表現平淡。")
+
+    render_diagnostics_panel(final_diag)
 
 else:
     st.info("請先點擊上方按鈕建立最新的資料庫！之後如果想要調整條件，只要切換上方的開關，系統就會用原有的資料瞬間重新幫你計算。")
